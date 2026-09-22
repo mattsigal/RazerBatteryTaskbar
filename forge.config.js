@@ -1,24 +1,16 @@
 module.exports = {
   packagerConfig: {
-    icon: 'src/assets/battery_90.png'
+    asar: true
   },
   rebuildConfig: {},
   makers: [
     {
       name: '@electron-forge/maker-squirrel',
-      config: {},
+      config: {}
     },
     {
       name: '@electron-forge/maker-zip',
-      platforms: ['darwin'],
-    },
-    {
-      name: '@electron-forge/maker-deb',
-      config: {},
-    },
-    {
-      name: '@electron-forge/maker-rpm',
-      config: {},
-    },
+      platforms: ['win32']
+    }
   ]
 };
