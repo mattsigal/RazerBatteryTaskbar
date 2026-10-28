@@ -41,6 +41,8 @@ const RazerProducts = {
 let tray = null;
 let pollTimer = null;
 let hiddenRendererWin = null;
+let isPolling = false;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let lastStatus = {
     connected: false,
     deviceName: 'Razer Device',
@@ -61,8 +63,8 @@ function buildRazerReport(cmdClass, cmdId, args = [], transactionId = 0x1f) {
     return Buffer.concat([Buffer.from([0x00]), payload]);
 }
 
-// Queries the mouse over Windows HID
-function queryMouseStatus() {
+// Queries the mouse over Windows HID asynchronously without busy-wait spinning
+async function queryMouseStatus() {
     try {
         const allDevices = HID.devices();
         const razerDevices = allDevices.filter(d => d.vendorId === RazerVendorId && RazerProducts[d.productId]);
@@ -85,8 +87,7 @@ function queryMouseStatus() {
         try {
             // 1. Query Battery Level (Class: 0x07, Cmd: 0x80)
             dev.sendFeatureReport(buildRazerReport(0x07, 0x80, [], productInfo.transactionId));
-            let start = Date.now();
-            while (Date.now() - start < 200) {}
+            await sleep(200);
 
             const battRep = dev.getFeatureReport(0x00, 91);
             if (!battRep || battRep.length < 11 || battRep[1] !== 0x02) {
@@ -104,8 +105,7 @@ function queryMouseStatus() {
 
             // 2. Query Charging Status (Class: 0x07, Cmd: 0x84)
             dev.sendFeatureReport(buildRazerReport(0x07, 0x84, [], productInfo.transactionId));
-            start = Date.now();
-            while (Date.now() - start < 150) {}
+            await sleep(150);
 
             const chgRep = dev.getFeatureReport(0x00, 91);
             const isCharging = chgRep && chgRep.length >= 11 && chgRep[1] === 0x02 && chgRep[10] === 1;
@@ -114,8 +114,7 @@ function queryMouseStatus() {
             let dpi = null;
             try {
                 dev.sendFeatureReport(buildRazerReport(0x04, 0x85, [0x00], productInfo.transactionId));
-                start = Date.now();
-                while (Date.now() - start < 150) {}
+                await sleep(150);
                 const dpiRep = dev.getFeatureReport(0x00, 91);
                 if (dpiRep && dpiRep.length >= 14 && dpiRep[1] === 0x02) {
                     dpi = (dpiRep[10] << 8) | dpiRep[11];
@@ -126,8 +125,7 @@ function queryMouseStatus() {
             let pollRate = null;
             try {
                 dev.sendFeatureReport(buildRazerReport(0x00, 0x85, [0x00], productInfo.transactionId));
-                start = Date.now();
-                while (Date.now() - start < 150) {}
+                await sleep(150);
                 const pollRep = dev.getFeatureReport(0x00, 91);
                 if (pollRep && pollRep.length >= 11 && pollRep[1] === 0x02) {
                     const b = pollRep[9] || pollRep[10];
@@ -293,7 +291,13 @@ async function renderDynamicIcon(pct, isCharging, connected) {
 
 // Updates tray icon, tooltip, and context menu
 async function updateTray() {
-    lastStatus = queryMouseStatus();
+    if (isPolling) return;
+    isPolling = true;
+    try {
+        lastStatus = await queryMouseStatus();
+    } finally {
+        isPolling = false;
+    }
     console.log(`[RazerBatteryTaskbar] ${lastStatus.deviceName}: ${lastStatus.connected ? `${lastStatus.percent}% (${lastStatus.isCharging ? '⚡ Charging' : 'Discharging'}) | DPI: ${lastStatus.dpi || 'N/A'} | Poll: ${lastStatus.pollRate ? lastStatus.pollRate + 'Hz' : 'N/A'}` : 'Disconnected/Asleep'}`);
 
     if (!tray) {
