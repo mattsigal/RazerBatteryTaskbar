@@ -9,7 +9,18 @@ if (require('electron-squirrel-startup')) app.quit();
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
     app.quit();
+} else {
+    app.on('second-instance', () => {
+        updateTray(true);
+    });
 }
+
+// Prevent exiting when windows close (tray-only app)
+app.on('window-all-closed', (e) => {
+    if (!app.isQuitting) {
+        e.preventDefault();
+    }
+});
 
 // Razer Constants & Supported Hardware
 const RazerVendorId = 0x1532;
@@ -51,6 +62,27 @@ let lastStatus = {
     dpi: null,
     pollRate: null
 };
+let cachedTarget = null;
+
+// Enumerates HID devices to locate supported Razer hardware
+function findRazerDevice() {
+    try {
+        const allDevices = HID.devices();
+        const razerDevices = allDevices.filter(d => d.vendorId === RazerVendorId && RazerProducts[d.productId]);
+        if (razerDevices.length === 0) return null;
+
+        const target = razerDevices.find(d => d.interface === 0) || razerDevices[0];
+        const productInfo = RazerProducts[target.productId] || { name: 'Razer Mouse', transactionId: 0x1f };
+        return {
+            path: target.path,
+            productId: target.productId,
+            name: productInfo.name,
+            transactionId: productInfo.transactionId
+        };
+    } catch (e) {
+        return null;
+    }
+}
 
 // Builds a Windows HID feature report for Razer hardware
 function buildRazerReport(cmdClass, cmdId, args = [], transactionId = 0x1f) {
@@ -63,104 +95,106 @@ function buildRazerReport(cmdClass, cmdId, args = [], transactionId = 0x1f) {
     return Buffer.concat([Buffer.from([0x00]), payload]);
 }
 
-// Queries the mouse over Windows HID asynchronously without busy-wait spinning
+// Queries the mouse over Windows HID asynchronously without busy-wait spinning or handle leaks
 async function queryMouseStatus() {
-    try {
-        const allDevices = HID.devices();
-        const razerDevices = allDevices.filter(d => d.vendorId === RazerVendorId && RazerProducts[d.productId]);
-
-        if (razerDevices.length === 0) {
+    if (!cachedTarget) {
+        cachedTarget = findRazerDevice();
+        if (!cachedTarget) {
             return { connected: false, deviceName: 'Razer Device', percent: null, isCharging: false, dpi: null, pollRate: null };
         }
+    }
 
-        // Target interface 0 (the primary mouse control collection)
-        let target = razerDevices.find(d => d.interface === 0) || razerDevices[0];
-        const productInfo = RazerProducts[target.productId] || { name: 'Razer Mouse', transactionId: 0x1f };
-
-        let dev;
+    let dev = null;
+    try {
+        dev = new HID.HID(cachedTarget.path);
+    } catch (err) {
+        // Cached path failed (device reconnect, wake from sleep, or dongle re-enumeration)
+        cachedTarget = findRazerDevice();
+        if (!cachedTarget) {
+            return { connected: false, deviceName: 'Razer Device', percent: null, isCharging: false, dpi: null, pollRate: null };
+        }
         try {
-            dev = new HID.HID(target.path);
-        } catch (err) {
-            return { connected: false, deviceName: productInfo.name, percent: null, isCharging: false, dpi: null, pollRate: null };
+            dev = new HID.HID(cachedTarget.path);
+        } catch (e) {
+            return { connected: false, deviceName: cachedTarget.name, percent: null, isCharging: false, dpi: null, pollRate: null };
+        }
+    }
+
+    try {
+        // 1. Query Battery Level (Class: 0x07, Cmd: 0x80)
+        dev.sendFeatureReport(buildRazerReport(0x07, 0x80, [], cachedTarget.transactionId));
+        await sleep(200);
+
+        const battRep = dev.getFeatureReport(0x00, 91);
+        if (!battRep || battRep.length < 11 || battRep[1] !== 0x02) {
+            return { connected: false, deviceName: cachedTarget.name, percent: null, isCharging: false, dpi: null, pollRate: null };
         }
 
+        const rawBatt = battRep[10];
+        if (rawBatt === 0) {
+            return { connected: false, deviceName: cachedTarget.name, percent: null, isCharging: false, dpi: null, pollRate: null };
+        }
+
+        const percent = Math.round((rawBatt / 255) * 100);
+
+        // 2. Query Charging Status (Class: 0x07, Cmd: 0x84)
+        dev.sendFeatureReport(buildRazerReport(0x07, 0x84, [], cachedTarget.transactionId));
+        await sleep(150);
+
+        const chgRep = dev.getFeatureReport(0x00, 91);
+        const isCharging = chgRep && chgRep.length >= 11 && chgRep[1] === 0x02 && chgRep[10] === 1;
+
+        // 3. Query DPI (Class: 0x04, Cmd: 0x85)
+        let dpi = null;
         try {
-            // 1. Query Battery Level (Class: 0x07, Cmd: 0x80)
-            dev.sendFeatureReport(buildRazerReport(0x07, 0x80, [], productInfo.transactionId));
-            await sleep(200);
-
-            const battRep = dev.getFeatureReport(0x00, 91);
-            if (!battRep || battRep.length < 11 || battRep[1] !== 0x02) {
-                dev.close();
-                return { connected: false, deviceName: productInfo.name, percent: null, isCharging: false, dpi: null, pollRate: null };
-            }
-
-            const rawBatt = battRep[10];
-            if (rawBatt === 0) {
-                dev.close();
-                return { connected: false, deviceName: productInfo.name, percent: null, isCharging: false, dpi: null, pollRate: null };
-            }
-
-            const percent = Math.round((rawBatt / 255) * 100);
-
-            // 2. Query Charging Status (Class: 0x07, Cmd: 0x84)
-            dev.sendFeatureReport(buildRazerReport(0x07, 0x84, [], productInfo.transactionId));
+            dev.sendFeatureReport(buildRazerReport(0x04, 0x85, [0x00], cachedTarget.transactionId));
             await sleep(150);
+            const dpiRep = dev.getFeatureReport(0x00, 91);
+            if (dpiRep && dpiRep.length >= 14 && dpiRep[1] === 0x02) {
+                dpi = (dpiRep[10] << 8) | dpiRep[11];
+            }
+        } catch (e) {}
 
-            const chgRep = dev.getFeatureReport(0x00, 91);
-            const isCharging = chgRep && chgRep.length >= 11 && chgRep[1] === 0x02 && chgRep[10] === 1;
+        // 4. Query Polling Rate (Class: 0x00, Cmd: 0x85)
+        let pollRate = null;
+        try {
+            dev.sendFeatureReport(buildRazerReport(0x00, 0x85, [0x00], cachedTarget.transactionId));
+            await sleep(150);
+            const pollRep = dev.getFeatureReport(0x00, 91);
+            if (pollRep && pollRep.length >= 11 && pollRep[1] === 0x02) {
+                const b = pollRep[9] || pollRep[10];
+                if (b === 1) pollRate = 1000;
+                else if (b === 2) pollRate = 500;
+                else if (b === 8) pollRate = 125;
+            }
+        } catch (e) {}
 
-            // 3. Query DPI (Class: 0x04, Cmd: 0x85)
-            let dpi = null;
-            try {
-                dev.sendFeatureReport(buildRazerReport(0x04, 0x85, [0x00], productInfo.transactionId));
-                await sleep(150);
-                const dpiRep = dev.getFeatureReport(0x00, 91);
-                if (dpiRep && dpiRep.length >= 14 && dpiRep[1] === 0x02) {
-                    dpi = (dpiRep[10] << 8) | dpiRep[11];
-                }
-            } catch (e) {}
-
-            // 4. Query Polling Rate (Class: 0x00, Cmd: 0x85)
-            let pollRate = null;
-            try {
-                dev.sendFeatureReport(buildRazerReport(0x00, 0x85, [0x00], productInfo.transactionId));
-                await sleep(150);
-                const pollRep = dev.getFeatureReport(0x00, 91);
-                if (pollRep && pollRep.length >= 11 && pollRep[1] === 0x02) {
-                    const b = pollRep[9] || pollRep[10];
-                    if (b === 1) pollRate = 1000;
-                    else if (b === 2) pollRate = 500;
-                    else if (b === 8) pollRate = 125;
-                }
-            } catch (e) {}
-
-            dev.close();
-            return {
-                connected: true,
-                deviceName: productInfo.name,
-                percent: Math.min(100, Math.max(0, percent)),
-                isCharging: Boolean(isCharging),
-                dpi,
-                pollRate
-            };
-        } catch (commErr) {
+        return {
+            connected: true,
+            deviceName: cachedTarget.name,
+            percent: Math.min(100, Math.max(0, percent)),
+            isCharging: Boolean(isCharging),
+            dpi,
+            pollRate
+        };
+    } catch (commErr) {
+        cachedTarget = null;
+        return { connected: false, deviceName: cachedTarget ? cachedTarget.name : 'Razer Device', percent: null, isCharging: false, dpi: null, pollRate: null };
+    } finally {
+        if (dev) {
             try { dev.close(); } catch (e) {}
-            return { connected: false, deviceName: productInfo.name, percent: null, isCharging: false, dpi: null, pollRate: null };
+            dev = null;
         }
-    } catch (e) {
-        return { connected: false, deviceName: 'Razer Device', percent: null, isCharging: false, dpi: null, pollRate: null };
     }
 }
 
 // Sets the mouse DPI directly over HID
 function setMouseDpi(dpi) {
+    if (!cachedTarget) cachedTarget = findRazerDevice();
+    if (!cachedTarget) return false;
+    let dev = null;
     try {
-        const allDevices = HID.devices();
-        const target = allDevices.find(d => d.vendorId === RazerVendorId && RazerProducts[d.productId] && d.interface === 0);
-        if (!target) return false;
-        const productInfo = RazerProducts[target.productId] || { transactionId: 0x1f };
-        const dev = new HID.HID(target.path);
+        dev = new HID.HID(cachedTarget.path);
         const args = [
             0x01, // VARSTORE
             (dpi >> 8) & 0xFF,
@@ -170,34 +204,43 @@ function setMouseDpi(dpi) {
             0x00,
             0x00
         ];
-        dev.sendFeatureReport(buildRazerReport(0x04, 0x05, args, productInfo.transactionId));
-        dev.close();
+        dev.sendFeatureReport(buildRazerReport(0x04, 0x05, args, cachedTarget.transactionId));
         console.log(`[RazerBatteryTaskbar] Successfully set DPI to ${dpi}`);
         return true;
     } catch (e) {
         console.error('[RazerBatteryTaskbar] Failed to set DPI:', e.message);
+        cachedTarget = null;
         return false;
+    } finally {
+        if (dev) {
+            try { dev.close(); } catch (e) {}
+            dev = null;
+        }
     }
 }
 
 // Sets the mouse polling rate directly over HID
 function setMousePollRate(rate) {
+    if (!cachedTarget) cachedTarget = findRazerDevice();
+    if (!cachedTarget) return false;
+    let dev = null;
     try {
-        const allDevices = HID.devices();
-        const target = allDevices.find(d => d.vendorId === RazerVendorId && RazerProducts[d.productId] && d.interface === 0);
-        if (!target) return false;
-        const productInfo = RazerProducts[target.productId] || { transactionId: 0x1f };
-        const dev = new HID.HID(target.path);
+        dev = new HID.HID(cachedTarget.path);
         let byteVal = 1; // 1000 Hz
         if (rate === 500) byteVal = 2;
         else if (rate === 125) byteVal = 8;
-        dev.sendFeatureReport(buildRazerReport(0x00, 0x05, [byteVal], productInfo.transactionId));
-        dev.close();
+        dev.sendFeatureReport(buildRazerReport(0x00, 0x05, [byteVal], cachedTarget.transactionId));
         console.log(`[RazerBatteryTaskbar] Successfully set polling rate to ${rate} Hz`);
         return true;
     } catch (e) {
         console.error('[RazerBatteryTaskbar] Failed to set polling rate:', e.message);
+        cachedTarget = null;
         return false;
+    } finally {
+        if (dev) {
+            try { dev.close(); } catch (e) {}
+            dev = null;
+        }
     }
 }
 
@@ -289,8 +332,26 @@ async function renderDynamicIcon(pct, isCharging, connected) {
     }
 }
 
-// Updates tray icon, tooltip, and context menu
-async function updateTray() {
+let renderedStatus = {
+    connected: null,
+    percent: null,
+    isCharging: null,
+    dpi: null,
+    pollRate: null
+};
+
+function hasStatusChanged(prev, curr) {
+    return (
+        prev.connected !== curr.connected ||
+        prev.percent !== curr.percent ||
+        prev.isCharging !== curr.isCharging ||
+        prev.dpi !== curr.dpi ||
+        prev.pollRate !== curr.pollRate
+    );
+}
+
+// Updates tray icon, tooltip, and context menu only when device status changes
+async function updateTray(forceRedraw = false) {
     if (isPolling) return;
     isPolling = true;
     try {
@@ -298,12 +359,21 @@ async function updateTray() {
     } finally {
         isPolling = false;
     }
-    console.log(`[RazerBatteryTaskbar] ${lastStatus.deviceName}: ${lastStatus.connected ? `${lastStatus.percent}% (${lastStatus.isCharging ? '⚡ Charging' : 'Discharging'}) | DPI: ${lastStatus.dpi || 'N/A'} | Poll: ${lastStatus.pollRate ? lastStatus.pollRate + 'Hz' : 'N/A'}` : 'Disconnected/Asleep'}`);
+
+    const changed = hasStatusChanged(renderedStatus, lastStatus);
+    console.log(`[RazerBatteryTaskbar] ${lastStatus.deviceName}: ${lastStatus.connected ? `${lastStatus.percent}% (${lastStatus.isCharging ? '⚡ Charging' : 'Discharging'}) | DPI: ${lastStatus.dpi || 'N/A'} | Poll: ${lastStatus.pollRate ? lastStatus.pollRate + 'Hz' : 'N/A'}` : 'Disconnected/Asleep'}${changed ? ' [State Changed]' : ''}`);
 
     if (!tray) {
         initTray();
         if (!tray) return;
     }
+
+    // Skip unmanaged GDI and HMENU handle recreation if state has not changed
+    if (!changed && !forceRedraw) {
+        return;
+    }
+
+    renderedStatus = { ...lastStatus };
 
     try {
         const icon = await renderDynamicIcon(lastStatus.percent, lastStatus.isCharging, lastStatus.connected);
@@ -326,7 +396,7 @@ async function updateTray() {
             checked: lastStatus.dpi === val,
             click: async () => {
                 setMouseDpi(val);
-                setTimeout(updateTray, 250);
+                setTimeout(() => updateTray(true), 250);
             }
         }));
 
@@ -338,7 +408,7 @@ async function updateTray() {
             checked: lastStatus.pollRate === rate,
             click: async () => {
                 setMousePollRate(rate);
-                setTimeout(updateTray, 250);
+                setTimeout(() => updateTray(true), 250);
             }
         }));
 
@@ -367,7 +437,7 @@ async function updateTray() {
             { type: 'separator' },
             {
                 label: 'Refresh Now',
-                click: () => updateTray()
+                click: () => updateTray(true)
             },
             {
                 label: 'Start with Windows',
@@ -425,20 +495,13 @@ app.whenReady().then(async () => {
     initTray();
 
     // Initial query and tray setup
-    await updateTray();
+    await updateTray(true);
 
     // Start background poll every 30 seconds
-    pollTimer = setInterval(updateTray, 30000);
+    pollTimer = setInterval(() => updateTray(false), 30000);
 
     // Sleep / Wake handling
     powerMonitor.on('resume', () => {
-        setTimeout(updateTray, 2000);
+        setTimeout(() => updateTray(true), 2000);
     });
-});
-
-// Prevent exiting when windows close
-app.on('window-all-closed', (e) => {
-    if (!app.isQuitting) {
-        e.preventDefault();
-    }
 });

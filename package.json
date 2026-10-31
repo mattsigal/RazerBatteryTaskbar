@@ -1,7 +1,7 @@
 {
   "name": "razerbatterytaskbar",
   "productName": "RazerBatteryTaskbar",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "main": "src/main.js",
   "author": "Tyler Dougherty, Matt Sigal",
   "license": "ISC",
